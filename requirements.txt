@@ -1,0 +1,9 @@
+google-generativeai==0.8.4
+faiss-cpu==1.10.0
+sentence-transformers==3.4.1
+pandas==2.2.3
+typer==0.15.1
+python-dotenv==1.0.1
+pydantic==2.10.6
+tenacity==9.0.0
+numpy<2.0.0

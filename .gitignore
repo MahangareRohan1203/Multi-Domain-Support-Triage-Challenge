@@ -1,0 +1,14 @@
+.env
+venv/
+__pycache__/
+.pytest_cache/
+*.log
+support_tickets/output.csv
+.DS_Store
+
+# Data files (often large, sometimes excluded depending on repo size limits)
+# If you want to keep them in GitHub, comment these out.
+# data/index.faiss
+# data/chunks.json
+# data/corpus.json
+# source_corpus/
