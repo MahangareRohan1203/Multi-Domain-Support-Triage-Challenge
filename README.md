@@ -68,6 +68,24 @@ PYTHONPATH=. pytest tests/test_agent.py
 
 ---
 
+### 📥 Ingestion Pipeline
+
+If you add new documentation to the `source_corpus/` directory, you must re-index the knowledge base.
+
+**Command:**
+```bash
+python3 code/ingest.py
+```
+
+**What it does:**
+1. **Crawls**: Scans the `source_corpus/` directory for Markdown files.
+2. **Chunks**: Splits text into 500-character segments with a 50-character overlap using a sliding window.
+3. **Embeds**: Converts text chunks into 384-dimensional vectors using `all-MiniLM-L6-v2`.
+4. **Indexes**: Creates a new `FAISS` FlatL2 index for high-speed semantic search.
+5. **Persists**: Overwrites `data/index.faiss` and `data/chunks.json` with the updated knowledge base.
+
+---
+
 ### 📈 Official Compliance
 
 | Field | Allowed Values |
