@@ -1,4 +1,4 @@
-google-generativeai==0.8.4
+ollama==0.4.7
 faiss-cpu==1.10.0
 sentence-transformers==3.4.1
 pandas==2.2.3

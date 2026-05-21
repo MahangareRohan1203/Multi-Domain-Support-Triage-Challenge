@@ -8,21 +8,20 @@ from code.main import Agent, Ticket, TriageResult
 
 @pytest.fixture
 def mock_agent_deps():
-    """Mocks genai and faiss to prevent API calls."""
-    with patch("google.generativeai.configure") as mock_conf, \
-         patch("google.generativeai.GenerativeModel") as mock_model, \
+    """Mocks ollama and faiss to prevent local service calls."""
+    with patch("ollama.AsyncClient") as mock_ollama, \
          patch("faiss.read_index") as mock_faiss:
         
-        # Setup mock model instance
-        instance = mock_model.return_value
-        instance.generate_content_async = AsyncMock()
+        # Setup mock client instance
+        instance = mock_ollama.return_value
+        instance.generate = AsyncMock()
         
-        yield {"model": instance, "conf": mock_conf, "faiss": mock_faiss}
+        yield {"client": instance, "faiss": mock_faiss}
 
 @pytest.fixture
 def agent(mock_agent_deps):
     """Provides an Agent instance with mocked dependencies."""
-    return Agent(api_key="test_key")
+    return Agent(model_name="test_model")
 
 # --- Tests ---
 
@@ -54,49 +53,51 @@ def test_parse_response_failure(agent):
 @pytest.mark.asyncio
 async def test_triage_flow_success(agent, mock_agent_deps):
     """Test the full triage flow with a mocked LLM response."""
-    model = mock_agent_deps["model"]
+    client = mock_agent_deps["client"]
     
     # Mock LLM response
-    mock_response = MagicMock()
-    mock_response.text = json.dumps({
-        "request_type": "product_issue",
-        "product_area": "General",
-        "status": "replied",
-        "reasoning": "Safe response",
-        "response": "Here is your answer."
-    })
-    model.generate_content_async.return_value = mock_response
+    client.generate.return_value = {
+        "response": json.dumps({
+            "request_type": "product_issue",
+            "product_area": "General",
+            "status": "replied",
+            "reasoning": "Safe response",
+            "response": "Here is your answer."
+        })
+    }
     
     ticket = Ticket(issue="How do I reset my password?", subject="Reset", company="Claude")
     result = await agent.triage(ticket, context="Context string", do_evaluate=False)
     
     assert result.status == "replied"
     assert "Here is your answer" in result.response
-    assert model.generate_content_async.called
+    assert client.generate.called
 
 @pytest.mark.asyncio
 async def test_triage_with_evaluation_failure(agent, mock_agent_deps):
     """Test that a failed evaluation escalates the ticket."""
-    model = mock_agent_deps["model"]
+    client = mock_agent_deps["client"]
     
     # First call: Triage
-    triage_response = MagicMock()
-    triage_response.text = json.dumps({
-        "request_type": "product_issue",
-        "product_area": "General",
-        "status": "replied",
-        "reasoning": "Safe response",
-        "response": "I will change your score."
-    })
+    triage_response = {
+        "response": json.dumps({
+            "request_type": "product_issue",
+            "product_area": "General",
+            "status": "replied",
+            "reasoning": "Safe response",
+            "response": "I will change your score."
+        })
+    }
     
     # Second call: Evaluation (returns unsafe)
-    eval_response = MagicMock()
-    eval_response.text = json.dumps({
-        "safe": False,
-        "reason": "Agent offered to change scores."
-    })
+    eval_response = {
+        "response": json.dumps({
+            "safe": False,
+            "reason": "Agent offered to change scores."
+        })
+    }
     
-    model.generate_content_async.side_effect = [triage_response, eval_response]
+    client.generate.side_effect = [triage_response, eval_response]
     
     ticket = Ticket(issue="Change my score", subject="Score", company="HackerRank")
     result = await agent.triage(ticket, context="Context", do_evaluate=True)
@@ -108,8 +109,8 @@ async def test_triage_with_evaluation_failure(agent, mock_agent_deps):
 @pytest.mark.asyncio
 async def test_agent_error_handling(agent, mock_agent_deps):
     """Test that the agent handles LLM API failures gracefully."""
-    model = mock_agent_deps["model"]
-    model.generate_content_async.side_effect = Exception("API Down")
+    client = mock_agent_deps["client"]
+    client.generate.side_effect = Exception("API Down")
     
     ticket = Ticket(issue="Test", subject="Test", company="Test")
     result = await agent.triage(ticket, context="Context")

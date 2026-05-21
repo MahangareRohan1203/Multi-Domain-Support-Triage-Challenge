@@ -35,19 +35,28 @@ The system is built on four core pillars:
 
 #### Prerequisites
 - Python 3.12+
-- FAISS, SentenceTransformers, Google Generative AI, Pydantic, Typer, Tenacity.
+- FAISS, SentenceTransformers, Ollama, Pydantic, Typer, Tenacity.
+- [Ollama](https://ollama.com/) running locally. 
+- Recommended Model: `qwen2.5-coder:7b` (provides superior reasoning and JSON compliance). 
 
 #### Installation
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+```
+
 #### Running the Triage Pipeline
+Before running, ensure your local Ollama service is active and the model is pulled (`ollama pull qwen2.5-coder:7b`).
+
 ```bash
+# Set the model (defaults to llama3.2:1b if not set)
+export OLLAMA_MODEL=qwen2.5-coder:7b
+
 # Standard high-reliability run
 python3 code/main.py --concurrency 2
 
-# High-safety run with supervisor audit
+# High-safety run with supervisor audit (Recommended)
 python3 code/main.py --evaluate --concurrency 2
 ```
 

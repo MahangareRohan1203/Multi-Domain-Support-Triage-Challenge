@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import List, Optional
 
 import faiss
-import google.generativeai as genai
+import ollama
 import pandas as pd
 import typer
 from dotenv import load_dotenv
@@ -17,11 +17,9 @@ from sentence_transformers import SentenceTransformer
 from tenacity import (
     before_sleep_log,
     retry,
-    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
 )
-from google.api_core import exceptions
 
 # Configure Logging
 logging.basicConfig(
@@ -63,8 +61,8 @@ class Retriever:
             self.chunks = json.load(f)
         logger.info("Knowledge Base loaded successfully.")
 
-    def get_context(self, query: str, company: str, k: int = 3) -> str:
-        """Retrieves relevant chunks, optionally filtered by company."""
+    def get_context(self, query: str, company: str, k: int = 4) -> str:
+        """Retrieves relevant chunks, optimized for accuracy (k=4)."""
         query_embedding = self.embed_model.encode([query]).astype("float32")
         distances, indices = self.index.search(query_embedding, k * 10)
         
@@ -74,72 +72,73 @@ class Retriever:
         for idx in indices[0]:
             if idx == -1: continue
             chunk = self.chunks[idx]
-            
-            # If company is provided and not generic, we filter. 
-            # Otherwise, we take the best semantic matches regardless of company.
             if is_cross_domain or chunk["company"].lower() == str(company).lower():
-                results.append(f"Company: {chunk['company']}\nSource: {chunk['url']}\nContent: {chunk['text']}")
+                results.append(f"[{chunk['company']}] {chunk['text']}")
             
             if len(results) >= k:
                 break
         
-        return "\n---\n".join(results) if results else "No specific support documentation found."
+        return "\n".join(results) if results else "No documentation found."
 
 class Agent:
-    """Core Triage Agent using Gemini LLM (Async version)."""
+    """Core Triage Agent using Local Ollama LLM (Async version)."""
     
-    def __init__(self, api_key: str, model_name: str = "gemini-1.5-flash"):
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(
-            model_name,
-            generation_config={"temperature": 0.0}
-        )
-        logger.info(f"Agent initialized with model {model_name} (temperature=0.0).")
+    def __init__(self, model_name: str = "llama3.2:1b"):
+        self.model_name = model_name
+        # Increase timeout to 120s for larger local models
+        self.client = ollama.AsyncClient(timeout=120.0)
+        logger.info(f"Agent initialized with local model {model_name}.")
 
     @retry(
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=2, min=4, max=60),
-        retry=retry_if_exception_type((
-            exceptions.ResourceExhausted, 
-            exceptions.ServiceUnavailable, 
-            exceptions.InternalServerError
-        )),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
         before_sleep=before_sleep_log(logger, logging.INFO),
     )
-    async def _call_llm_async(self, prompt: str) -> str:
-        """Asynchronous call to the LLM."""
-        response = await self.model.generate_content_async(prompt)
-        return response.text
+    async def _call_llm_async(self, prompt: str, format: str = "") -> str:
+        """Asynchronous call to the local Ollama LLM."""
+        options = {"temperature": 0.0}
+        response = await self.client.generate(
+            model=self.model_name, 
+            prompt=prompt, 
+            format=format, 
+            stream=False,
+            options=options
+        )
+        return response['response']
 
     async def triage(self, ticket: Ticket, context: str, do_evaluate: bool = False) -> TriageResult:
         """Processes a single ticket and returns a TriageResult."""
         prompt = self._build_prompt(ticket, context)
         
         try:
-            raw_response = await self._call_llm_async(prompt)
+            # Request JSON format explicitly
+            raw_response = await self._call_llm_async(prompt, format="json")
             
             try:
                 result = self._parse_response(raw_response)
             except (ValueError, ValidationError, json.JSONDecodeError) as ve:
                 logger.warning(f"Response parsing failed for '{ticket.subject}': {ve}. Attempting fallback parsing.")
-                # Basic regex fallback or default
                 result = self._fallback_parse(raw_response)
             
             # Ensure official allowed values (lowercase)
             result.status = result.status.lower()
             if result.status not in ["replied", "escalated"]:
-                result.status = "escalated"
+                # Logic check: if no documentation found, escalate
+                if "No documentation found" in context:
+                    result.status = "escalated"
+                else:
+                    result.status = "replied"
             
             # Ensure official allowed values for request_type
             valid_request_types = ["product_issue", "feature_request", "bug", "invalid"]
-            if result.request_type.lower() not in valid_request_types:
-                rt = result.request_type.lower()
-                if "bug" in rt: result.request_type = "bug"
-                elif "feature" in rt: result.request_type = "feature_request"
-                elif "invalid" in rt or "unknown" in rt: result.request_type = "invalid"
-                else: result.request_type = "product_issue" # Default
+            rt_lower = result.request_type.lower()
+            if rt_lower not in valid_request_types:
+                if "bug" in rt_lower: result.request_type = "bug"
+                elif "feature" in rt_lower: result.request_type = "feature_request"
+                elif "invalid" in rt_lower or "unknown" in rt_lower: result.request_type = "invalid"
+                else: result.request_type = "product_issue"
             else:
-                result.request_type = result.request_type.lower()
+                result.request_type = rt_lower
 
             if do_evaluate and result.status == "replied":
                 eval_result = await self.evaluate(ticket, context, result)
@@ -180,80 +179,109 @@ class Agent:
 
     async def evaluate(self, ticket: Ticket, context: str, result: TriageResult) -> dict:
         """Secondary evaluation step to ensure response safety and accuracy."""
+        # Force escalation for high-risk keywords if not already escalated
+        high_risk_terms = ["identity theft", "stolen", "fraud", "blocked", "compromised"]
+        if result.status == "replied":
+            if any(term in ticket.issue.lower() for term in high_risk_terms) or \
+               any(term in ticket.subject.lower() for term in high_risk_terms):
+                return {"safe": False, "reason": "High-risk security/fraud topic must be escalated to a human."}
+
         eval_prompt = f"""
-        You are a senior support supervisor reviewing a junior agent's work.
-        Determine if the response is safe, grounded in context, and does not hallucinate policies.
+        You are a senior support supervisor. Review the following support response for safety and grounding.
         
         TICKET: {ticket.issue}
         CONTEXT: {context}
-        AGENT RESPONSE: {result.response}
+        PROPOSED RESPONSE: {result.response}
         
         CRITERIA:
-        1. Is the response supported by the context?
-        2. Does it avoid making unsupported promises or claims?
-        3. Is it professionally appropriate?
+        1. **Safety**: If the agent offers to perform sensitive actions (changing scores, granting access, issuing refunds, resolving fraud) without documentation support, it is UNSAFE.
+        2. **High Risk**: ANY ticket involving Identity Theft, Stolen Cards, Fraud, or Account Compromise MUST be escalated.
+        3. **Grounding**: If the agent makes up facts, URLs, or email addresses NOT found in the context, it is UNSAFE.
+        4. **Adequacy**: If the context is empty or clearly irrelevant, the agent should have escalated.
         
-        OUTPUT FORMAT:
-        Output valid JSON only:
+        If the response is a polite "out of scope" message for a nonsense request, it is SAFE.
+        
+        OUTPUT FORMAT (JSON ONLY):
         {{
           "safe": true/false,
-          "reason": "Brief explanation"
+          "reason": "explanation"
         }}
         """
         try:
-            raw_eval = await self._call_llm_async(eval_prompt)
-            json_match = re.search(r"\{.*\}", raw_eval, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group(0))
-            return {"safe": True, "reason": "Eval failed to produce JSON, defaulting to safe."}
+            raw_eval = await self._call_llm_async(eval_prompt, format="json")
+            return json.loads(raw_eval)
         except:
-            return {"safe": True, "reason": "Eval API error, defaulting to safe."}
+            return {"safe": True, "reason": "Eval failed, defaulting to safe."}
 
     def _build_prompt(self, ticket: Ticket, context: str) -> str:
         return f"""
-You are an expert support triage agent for {ticket.company}. 
-Analyze the ticket and provide a comprehensive response based on the provided support documentation.
+Act as a professional support triage specialist for {ticket.company}. 
+Your task is to classify the support ticket and provide a response based **ONLY** on the provided context.
 
-TICKET DETAILS:
-Subject: {ticket.subject}
-Issue: {ticket.issue}
+### TICKET DETAILS
+- **Subject**: {ticket.subject}
+- **Issue**: {ticket.issue}
 
-SUPPORT CONTEXT:
+### DOCUMENTATION CONTEXT
 {context}
 
-TASKS:
-1. Classify 'request_type' (Allowed values: product_issue, feature_request, bug, invalid).
-2. Classify 'product_area' (e.g., Account, Billing, Security, Technical, Integration, Assessment).
-3. Determine 'status' (Allowed values: replied, escalated).
-   ESCALATE IF:
-   - High-risk security/fraud (stolen cards, hacked accounts).
-   - Threats of violence or self-harm.
-   - Legal or regulatory complaints.
-   - Requests to change scores or bypass anti-cheating (for HackerRank).
-   - Complex billing issues needing manual verification.
-   - The issue is entirely unsupported by the context.
-4. Generate 'response':
-   - If Status is 'replied': Provide a professional, concise answer based ONLY on the context. 
-   - If Status is 'escalated': Provide a polite explanation of why the case is being moved to a human expert.
+### CLASSIFICATION RULES:
+1. **request_type**:
+   - `bug`: Explicit mention of things not working, errors, or unexpected behavior.
+   - `feature_request`: Requests for new functionality or improvements.
+   - `invalid`: ONLY for spam, completely nonsensical text, or topics totally unrelated to professional software/finance support (e.g., "what is the weather"). 
+   - `product_issue`: General questions, "how-to" queries, account management, or technical help. 
+   - **Note**: If the user asks about a feature like "Claude for students" or "Resume builder", it is a `product_issue` or `feature_request`, NOT `invalid`.
 
-OUTPUT FORMAT:
-Output valid JSON only:
+2. **product_area**:
+   - Identify the specific feature or department (e.g., "Billing", "API", "Security", "Account").
+
+3. **status**:
+   - `replied`: 
+     - The provided context contains a clear answer.
+     - OR the request is truly `invalid` (nonsense/spam).
+   - `escalated`: 
+     - **MANDATORY** for: Identity Theft, Stolen Cards, Fraud, Security breaches, Legal threats, or sensitive Account Access (e.g., "lost owner access").
+     - The context is missing or does not address the issue.
+
+4. **reasoning**:
+   - A short, one-sentence internal justification for your classification.
+
+5. **response**:
+   - If `request_type` is `invalid`: "I'm sorry, but that request is outside the scope of my capabilities as a support assistant."
+   - If `status` is `replied`: Provide a helpful, concise answer based strictly on the context. Do not invent links or emails.
+   - If `status` is `escalated`: Explain that you are escalating this to a specialized human team for investigation.
+
+### OUTPUT FORMAT:
+JSON ONLY.
 {{
-  "request_type": "product_issue | feature_request | bug | invalid",
+  "request_type": "...",
   "product_area": "...",
-  "status": "replied | escalated",
+  "status": "...",
   "reasoning": "...",
   "response": "..."
 }}
 """
 
     def _parse_response(self, text: str) -> TriageResult:
-        """Extracts and validates JSON from LLM response."""
-        json_match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not json_match:
-            raise ValueError("No JSON found in LLM response")
+        """Extracts and validates JSON from LLM response with repair logic."""
+        # Find the first { and the last }
+        start_idx = text.find('{')
+        end_idx = text.rfind('}')
         
-        data = json.loads(json_match.group(0))
+        if start_idx == -1 or end_idx == -1:
+            raise ValueError("No JSON object found in LLM response")
+            
+        json_str = text[start_idx:end_idx+1]
+        
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError:
+            # Simple repair: try to fix common trailing commas or unescaped quotes
+            # This is a basic attempt, pydantic might still fail if logic is broken
+            json_str = re.sub(r',\s*\}', '}', json_str)
+            data = json.loads(json_str)
+            
         return TriageResult.model_validate(data)
 
 # --- CLI Application ---
@@ -317,30 +345,25 @@ def run(
     output_csv: str = "support_tickets/output.csv",
     log_file: str = "log.txt",
     evaluate: bool = typer.Option(False, "--evaluate", help="Enable secondary evaluation step"),
-    concurrency: int = typer.Option(2, "--concurrency", help="Max concurrent API calls")
+    concurrency: int = typer.Option(2, "--concurrency", help="Max concurrent API calls"),
+    model: str = typer.Option(os.getenv("OLLAMA_MODEL", "llama3.2:1b"), "--model", help="Local model name")
 ):
-    """Run the Multi-Domain Triage Agent with Async support and Evaluation."""
-    load_dotenv()
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        typer.echo("Error: GOOGLE_API_KEY not found in environment.", err=True)
-        raise typer.Exit(1)
-
+    """Run the Multi-Domain Triage Agent with Local LLM (Ollama)."""
     # Initialize Log
     with open(log_file, "w") as f:
-        f.write(f"=== TRIAGE AGENT LOG ===\nStarted: {datetime.now()}\n")
-        f.write(f"Mode: Async | Evaluation: {evaluate} | Concurrency: {concurrency}\n\n")
+        f.write(f"=== TRIAGE AGENT LOG (LOCAL) ===\nStarted: {datetime.now()}\n")
+        f.write(f"Mode: Async | Evaluation: {evaluate} | Concurrency: {concurrency} | Model: {model}\n\n")
 
     try:
         # Paths are relative to root if run from root
         retriever = Retriever("data/index.faiss", "data/chunks.json")
-        agent = Agent(api_key)
+        agent = Agent(model_name=model)
     except Exception as e:
         typer.echo(f"Initialization Failed: {e}", err=True)
         raise typer.Exit(1)
 
     df = pd.read_csv(input_csv)
-    typer.echo(f"Processing {len(df)} tickets (Concurrency={concurrency}, Eval={evaluate})...")
+    typer.echo(f"Processing {len(df)} tickets (Model={model}, Concurrency={concurrency}, Eval={evaluate})...")
     
     results = asyncio.run(process_tickets_async(df, retriever, agent, evaluate, log_file, concurrency))
 
